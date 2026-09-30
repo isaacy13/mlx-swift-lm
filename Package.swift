@@ -68,6 +68,15 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
     ],
     targets: [
+        .testTarget(
+            name: "MLXProducerLifecycleTests",
+            dependencies: [
+                "MLXLMCommon", "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Tests/MLXProducerLifecycleTests"
+        ),
         .target(
             name: "MLXLLM",
             dependencies: [

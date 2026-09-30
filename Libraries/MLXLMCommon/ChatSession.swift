@@ -793,6 +793,18 @@ public final class ChatSession {
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = []
     ) -> AsyncThrowingStream<String, Error> {
+        streamResponseTask(
+            to: prompt, role: role, images: images, videos: videos, audios: audios
+        ).stream
+    }
+
+    public func streamResponseTask(
+        to prompt: String,
+        role: Chat.Message.Role = .user,
+        images: consuming [UserInput.Image] = [],
+        videos: consuming [UserInput.Video] = [],
+        audios: consuming [UserInput.Audio] = []
+    ) -> (stream: AsyncThrowingStream<String, Error>, task: Task<Void, Never>) {
         streamMap(
             to: prompt, role: role, images: images, videos: videos, audios: audios,
             failOnRejectedToolCall: true
@@ -811,6 +823,12 @@ public final class ChatSession {
     public func streamResponse(
         to messages: consuming [Chat.Message]
     ) -> AsyncThrowingStream<String, Error> {
+        streamResponseTask(to: messages).stream
+    }
+
+    public func streamResponseTask(
+        to messages: consuming [Chat.Message]
+    ) -> (stream: AsyncThrowingStream<String, Error>, task: Task<Void, Never>) {
         streamMap(messages: messages, failOnRejectedToolCall: true) { $0.chunk }
     }
 
@@ -834,9 +852,10 @@ public final class ChatSession {
         videos: consuming [UserInput.Video] = [],
         audios: consuming [UserInput.Audio] = [],
     ) -> AsyncThrowingStream<Generation, Error> {
-        streamMap(to: prompt, role: role, images: images, videos: videos, audios: audios) {
-            $0
-        }
+        let response = streamMap(
+            to: prompt, role: role, images: images, videos: videos, audios: audios
+        ) { $0 }
+        return response.stream
     }
 
     /// Produces a streaming response after appending a batch of structured chat messages as `Generation`.
@@ -853,9 +872,8 @@ public final class ChatSession {
     public func streamDetails(
         to messages: consuming [Chat.Message]
     ) -> AsyncThrowingStream<Generation, Error> {
-        streamMap(messages: messages) {
-            $0
-        }
+        let response = streamMap(messages: messages) { $0 }
+        return response.stream
     }
 
     /// Produces a streaming response to a prompt by transforming the
@@ -875,7 +893,7 @@ public final class ChatSession {
         audios: consuming [UserInput.Audio] = [],
         failOnRejectedToolCall: Bool = false,
         transform: @Sendable @escaping (Generation) -> R?
-    ) -> AsyncThrowingStream<R, Error> {
+    ) -> (stream: AsyncThrowingStream<R, Error>, task: Task<Void, Never>) {
         streamMap(
             messages: [
                 .init(role: role, content: prompt, images: images, videos: videos, audios: audios)
@@ -889,7 +907,7 @@ public final class ChatSession {
         messages: consuming [Chat.Message],
         failOnRejectedToolCall: Bool = false,
         transform: @Sendable @escaping (Generation) -> R?
-    ) -> AsyncThrowingStream<R, Error> {
+    ) -> (stream: AsyncThrowingStream<R, Error>, task: Task<Void, Never>) {
         let (stream, continuation) = AsyncThrowingStream<R, Error>.makeStream()
 
         // images and videos are not Sendable (MLXArray) but they are consumed
@@ -904,6 +922,7 @@ public final class ChatSession {
                 speculativeDecoding
             ] in
             do {
+                try Task.checkCancellation()
                 // Automatic dispatch must always be schema-authorized. Treat a missing
                 // declaration list as an empty allowlist when a dispatcher is installed,
                 // rather than allowing the processor's schema-less parsing mode.
@@ -911,6 +930,8 @@ public final class ChatSession {
                     toolDispatch == nil ? tools : (tools ?? [])
 
                 try await cache.update { cache in
+                    try Task.checkCancellation()
+                    let preparationStream = StreamOrDevice.default.stream
 
                     // these are all Sendable
                     let processor = await model.processor
@@ -1003,6 +1024,12 @@ public final class ChatSession {
                             .init(main: kvCache, conversation: conversation))
                     }
 
+                    defer {
+                        withExtendedLifetime((model, kvCache, draftKVCache)) {
+                            preparationStream.synchronize()
+                        }
+                    }
+
                     var pendingMessages = inputMessages.consume()
 
                     // How this model's generated token stream relates to a chat
@@ -1014,6 +1041,7 @@ public final class ChatSession {
 
                     // loop can restart on tool calls
                     restart: while !pendingMessages.isEmpty {
+                        try Task.checkCancellation()
                         let isToolResultContinuation =
                             pendingMessages.contains { $0.role == .tool }
                             && conversation?.messages.last?.tool?.calls?.isEmpty == false
@@ -1042,7 +1070,9 @@ public final class ChatSession {
                             chat: templateMessages,
                             processing: processing,
                             tools: tools, additionalContext: additionalContext)
+                        try Task.checkCancellation()
                         let preparedInput = try await processor.prepare(input: userInput)
+                        try Task.checkCancellation()
                         var input = preparedInput
                         pendingMessages.removeAll()
 
@@ -1199,6 +1229,7 @@ public final class ChatSession {
                         // Select the token iterator based on speculative decoding configuration.
                         let generation: GenerationRun
                         func defaultGeneration() throws -> GenerationRun {
+                            try Task.checkCancellation()
                             // Seed the carried state and read back the post-prefill state so the
                             // next turn, or the next tool restart, anchors correctly.
                             let iterator = try TokenIterator(
@@ -1316,6 +1347,7 @@ public final class ChatSession {
                                                 conversation: conversation))
                                     }
 
+                                    try Task.checkCancellation()
                                     let iterator = try SpeculativeTokenIterator(
                                         input: input,
                                         mainModel: model,
@@ -1427,7 +1459,9 @@ public final class ChatSession {
                                     .assistant("", toolCalls: pendingToolCalls))
                             }
                             for toolCall in pendingToolCalls {
+                                try Task.checkCancellation()
                                 let toolResult = try await toolDispatch(toolCall)
+                                try Task.checkCancellation()
                                 pendingMessages.append(
                                     .tool(
                                         toolResult, id: toolCall.id,
@@ -1457,7 +1491,7 @@ public final class ChatSession {
             task.cancel()
         }
 
-        return stream
+        return (stream, task)
     }
 
     /// Produces a streaming response to a prompt.

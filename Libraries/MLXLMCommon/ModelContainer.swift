@@ -201,6 +201,19 @@ public final class ModelContainer: Sendable {
         wiredMemoryTicket: WiredMemoryTicket? = nil,
         tools: [[String: any Sendable]]? = nil
     ) async throws -> AsyncStream<Generation> {
+        try await generateTask(
+            input: input, parameters: parameters,
+            wiredMemoryTicket: wiredMemoryTicket, tools: tools
+        ).stream
+    }
+
+    public func generateTask(
+        input: consuming sending LMInput,
+        parameters: GenerateParameters,
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        tools: [[String: any Sendable]]? = nil
+    ) async throws -> (stream: AsyncStream<Generation>, task: Task<Void, Never>) {
+        try Task.checkCancellation()
         let input = SendableBox(input)
 
         // Note: this is only visiting the model exclusively
@@ -211,7 +224,7 @@ public final class ModelContainer: Sendable {
         // model weights themselves (but they are already evaluated).
 
         return try await context.read { context in
-            try MLXLMCommon.generate(
+            try MLXLMCommon.generateTask(
                 input: input.consume(),
                 parameters: parameters,
                 context: context,

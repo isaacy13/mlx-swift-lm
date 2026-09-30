@@ -864,39 +864,47 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 
     mutating func prepare(input: LMInput, prefill: PrefillParameters = .init()) throws {
-        processor?.prompt(input.text.tokens)
-        let inputLength = input.text.cacheSequenceLength
+        let preparationStream = StreamOrDevice.default.stream
+        do {
+            processor?.prompt(input.text.tokens)
+            let inputLength = input.text.cacheSequenceLength
 
-        switch try model.prepare(input, cache: cache, state: state, prefill: prefill) {
-        case .tokens(let tokens):
-            let remainingLength = tokens.cacheSequenceLength
-            precondition(
-                remainingLength <= inputLength,
-                "LanguageModel.prepare returned more tokens than it received")
-            cacheStorage.commitProcessedTokens(inputLength - remainingLength)
-            y = tokens
+            switch try model.prepare(input, cache: cache, state: state, prefill: prefill) {
+            case .tokens(let tokens):
+                let remainingLength = tokens.cacheSequenceLength
+                precondition(
+                    remainingLength <= inputLength,
+                    "LanguageModel.prepare returned more tokens than it received")
+                cacheStorage.commitProcessedTokens(inputLength - remainingLength)
+                y = tokens
 
-            // evaluate the remainder of the prompt -- this primes the pump
-            let token = step(previous: y)
-            y = .init(tokens: token)
-            asyncEval(y.tokens)
+                // evaluate the remainder of the prompt -- this primes the pump
+                let token = step(previous: y)
+                y = .init(tokens: token)
+                asyncEval(y.tokens)
 
-            // the model reported per-chunk progress; the remainder it left to us
-            // completes the prompt (models returning .logits report their own terminal)
-            let total = input.text.tokens.size
-            prefill.progress?(total, total)
+                // the model reported per-chunk progress; the remainder it left to us
+                // completes the prompt (models returning .logits report their own terminal)
+                let total = input.text.tokens.size
+                prefill.progress?(total, total)
 
-        case .logits(let result):
-            cacheStorage.commitProcessedTokens(inputLength)
-            // carry the prefill state into decode, as step(previous:) does for later steps
-            self.state = result.state
-            y = .init(tokens: convertToToken(logits: result.logits))
-            asyncEval(y.tokens)
+            case .logits(let result):
+                cacheStorage.commitProcessedTokens(inputLength)
+                // carry the prefill state into decode, as step(previous:) does for later steps
+                self.state = result.state
+                y = .init(tokens: convertToToken(logits: result.logits))
+                asyncEval(y.tokens)
 
-            break
+                break
+            }
+
+            try kvCachePlan.applyAndValidate(to: cacheStorage)
+        } catch {
+            withExtendedLifetime((model, cacheStorage)) {
+                preparationStream.synchronize()
+            }
+            throw error
         }
-
-        try kvCachePlan.applyAndValidate(to: cacheStorage)
     }
 
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
@@ -1761,10 +1769,31 @@ public func generate(
     wiredMemoryTicket: WiredMemoryTicket? = nil,
     tools: [[String: any Sendable]]? = nil
 ) throws -> AsyncStream<Generation> {
+    try generateTask(
+        input: input, cache: cache, state: state, parameters: parameters, context: context,
+        components: components, wiredMemoryTicket: wiredMemoryTicket, tools: tools
+    ).stream
+}
+
+public func generateTask(
+    input: LMInput, cache: [KVCache]? = nil, state: LMOutput.State? = nil,
+    parameters: GenerateParameters, context: ModelContext,
+    components: GenerationComponents = .init(),
+    wiredMemoryTicket: WiredMemoryTicket? = nil,
+    tools: [[String: any Sendable]]? = nil
+) throws -> (stream: AsyncStream<Generation>, task: Task<Void, Never>) {
+    try Task.checkCancellation()
+    let preparationStream = StreamOrDevice.default.stream
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, state: state,
         parameters: parameters, components: components)
-    let (stream, _) = generateTask(
+    if Task.isCancelled {
+        withExtendedLifetime(iterator) {
+            preparationStream.synchronize()
+        }
+        throw CancellationError()
+    }
+    return generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
@@ -1772,7 +1801,6 @@ public func generate(
         wiredMemoryTicket: wiredMemoryTicket,
         tools: tools,
         toolCallPolicy: parameters.toolCallPolicy)
-    return stream
 }
 
 /// Generates text and tool calls asynchronously using speculative decoding with a draft model.
@@ -2463,7 +2491,7 @@ private func generateLoopTask<
             _ = continuation.yield(handler.infoEvent(info))
 
             // Synchronize with the stream to ensure tasks are completed
-            Stream().synchronize()
+            StreamOrDevice.default.stream.synchronize()
 
             // Finalize the stream
             continuation.finish()
