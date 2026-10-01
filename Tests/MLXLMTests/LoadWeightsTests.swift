@@ -71,12 +71,21 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
     }
 }
 
+private func checkpointArrayIsAvailable(
+    _ array: MLXArray, file: StaticString = #filePath, line: UInt = #line
+) -> Bool {
+    var available = false
+    let status = _mlx_array_is_available(&available, array.ctx)
+    XCTAssertEqual(status, 0, "Pinned internal array availability check failed", file: file, line: line)
+    return available
+}
+
 private final class CheckpointSanitizationProbe {
     var invocationCount = 0
     var inputKeys: Set<String> = []
     var metadata: [String: String] = [:]
     var discardedTensor: MLXArray?
-    var discardedWasMaterializedAtEntry: Bool?
+    var discardedWasAvailableAtEntry: Bool?
     var inspectedLayerValues: [Float] = []
     var preparationCount = 0
     var layerValuesAtPreparation: [Float] = []
@@ -88,7 +97,7 @@ private final class CheckpointSanitizationProbe {
         self.metadata = metadata
         discardedTensor = weights["unused.weight"]
         if let discardedTensor {
-            discardedWasMaterializedAtEntry = mlx_array_data_float32(discardedTensor.ctx) != nil
+            discardedWasAvailableAtEntry = checkpointArrayIsAvailable(discardedTensor)
         }
     }
 }
@@ -543,6 +552,17 @@ final class LoadWeightsTests: XCTestCase {
         }
     }
 
+    func testPinnedAvailabilityObserverDoesNotEvaluateLazyArray() {
+        let lazy = MLXArray(converting: [1.0, 2, 3, 4]) + 1
+        for _ in 0..<3 {
+            XCTAssertFalse(checkpointArrayIsAvailable(lazy))
+        }
+        eval(lazy)
+        XCTAssertTrue(checkpointArrayIsAvailable(lazy))
+        XCTAssertEqual(lazy.asArray(Float.self), [2, 3, 4, 5])
+        XCTAssertTrue(checkpointArrayIsAvailable(lazy))
+    }
+
     func testLoadWeightsSanitizesCompleteCheckpointBeforeEvaluatingDiscardedTensor() throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -554,10 +574,10 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(model.probe.invocationCount, 1)
         XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
         XCTAssertEqual(model.probe.metadata, ["format": "fixture", "transpose": "true"])
-        XCTAssertEqual(model.probe.discardedWasMaterializedAtEntry, false)
+        XCTAssertEqual(model.probe.discardedWasAvailableAtEntry, false)
         let discarded = try XCTUnwrap(model.probe.discardedTensor)
         XCTAssertEqual(discarded.dtype, .float32)
-        XCTAssertNil(mlx_array_data_float32(discarded.ctx))
+        XCTAssertFalse(checkpointArrayIsAvailable(discarded))
         XCTAssertEqual(model.probe.inspectedLayerValues, [1, 2, 3, 4, 90, 91])
         XCTAssertEqual(model.layer.weight.shape, [2, 2])
         XCTAssertEqual(model.layer.weight.asArray(Float.self), [1, 3, 2, 4])
@@ -565,7 +585,7 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(model.probe.preparationCount, 1)
         XCTAssertEqual(model.probe.layerValuesAtPreparation, [1, 3, 2, 4])
         XCTAssertEqual(model.probe.projectorValuesAtPreparation, [31, 32, 33, 34])
-        XCTAssertNil(mlx_array_data_float32(discarded.ctx))
+        XCTAssertFalse(checkpointArrayIsAvailable(discarded))
     }
 
     func testLoadWeightArraysDefaultStillMaterializesEverySelectedTensor() throws {
@@ -582,7 +602,7 @@ final class LoadWeightsTests: XCTestCase {
         for key in ["checkpoint.layer", "checkpoint.projector", "unused.weight"] {
             let array = try XCTUnwrap(weights[key])
             XCTAssertEqual(array.dtype, .float32)
-            XCTAssertNotNil(mlx_array_data_float32(array.ctx), key)
+            XCTAssertTrue(checkpointArrayIsAvailable(array), key)
         }
     }
 
@@ -691,9 +711,9 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(model.probe.invocationCount, 1)
         XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
         XCTAssertEqual(model.probe.metadata, ["transpose": "true"])
-        XCTAssertEqual(model.probe.discardedWasMaterializedAtEntry, false)
+        XCTAssertEqual(model.probe.discardedWasAvailableAtEntry, false)
         let discarded = try XCTUnwrap(model.probe.discardedTensor)
-        XCTAssertNil(mlx_array_data_float32(discarded.ctx))
+        XCTAssertFalse(checkpointArrayIsAvailable(discarded))
         XCTAssertEqual(model.probe.inspectedLayerValues, [1, 2, 3, 4, 90, 91])
         XCTAssertEqual(model.layer.weight.asArray(Float.self), [1, 3, 2, 4])
         XCTAssertEqual(model.projector.weight.asArray(Float.self), [31, 32, 33, 34])
