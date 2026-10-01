@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import Cmlx
 import Foundation
 import MLX
 import MLXNN
@@ -70,6 +71,99 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
     }
 }
 
+private final class CheckpointSanitizationProbe {
+    var invocationCount = 0
+    var inputKeys: Set<String> = []
+    var metadata: [String: String] = [:]
+    var discardedTensor: MLXArray?
+    var discardedWasMaterializedAtEntry: Bool?
+    var inspectedLayerValues: [Float] = []
+    var preparationCount = 0
+    var layerValuesAtPreparation: [Float] = []
+    var projectorValuesAtPreparation: [Float] = []
+
+    func record(weights: [String: MLXArray], metadata: [String: String]) {
+        invocationCount += 1
+        inputKeys = Set(weights.keys)
+        self.metadata = metadata
+        discardedTensor = weights["unused.weight"]
+        if let discardedTensor {
+            discardedWasMaterializedAtEntry = mlx_array_data_float32(discardedTensor.ctx) != nil
+        }
+    }
+}
+
+private final class SanitizingCheckpointModel: Module,
+    AdditionalWeightFilesProviding, LanguageModel, KVCacheDimensionProvider
+{
+    @ModuleInfo(key: "layer") var layer: Linear
+    @ModuleInfo(key: "projector") var projector: Linear
+    let probe = CheckpointSanitizationProbe()
+    let declaresSidecar: Bool
+    let kvHeads: [Int] = []
+    var additionalWeightFiles: [String] { declaresSidecar ? ["projector.safetensors"] : [] }
+
+    init(declaresSidecar: Bool = true) {
+        self.declaresSidecar = declaresSidecar
+        _layer.wrappedValue = Linear(2, 2, bias: false)
+        _projector.wrappedValue = Linear(2, 2, bias: false)
+        super.init()
+    }
+
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray] {
+        probe.record(weights: weights, metadata: metadata)
+        var result: [String: MLXArray] = [:]
+        if let source = weights["checkpoint.layer"] {
+            probe.inspectedLayerValues = source.asArray(Float.self)
+            let retained = source[0..<2, 0..<2]
+            result["layer.weight"] = metadata["transpose"] == "true" ? retained.T : retained
+        }
+        if let source = weights["checkpoint.projector"] {
+            result["projector.weight"] = source
+        }
+        return result
+    }
+
+    func prepare() throws {
+        probe.preparationCount += 1
+        probe.layerValuesAtPreparation = layer.weight.asArray(Float.self)
+        probe.projectorValuesAtPreparation = projector.weight.asArray(Float.self)
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        layer(inputs)
+    }
+}
+
+private final class SanitizingQuantizedCheckpointModel: Module, BaseLanguageModel,
+    AdditionalWeightFilesProviding
+{
+    @ModuleInfo(key: "layer") var layer: Linear
+    @ModuleInfo(key: "projector") var projector: Linear
+    let probe = CheckpointSanitizationProbe()
+    var additionalWeightFiles: [String] { ["projector.safetensors"] }
+
+    override init() {
+        _layer.wrappedValue = Linear(32, 2, bias: false)
+        _projector.wrappedValue = Linear(32, 2, bias: false)
+        super.init()
+    }
+
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray] {
+        probe.record(weights: weights, metadata: metadata)
+        var result: [String: MLXArray] = [:]
+        for (key, value) in weights where key.hasPrefix("checkpoint.") {
+            result[String(key.dropFirst("checkpoint.".count))] = value
+        }
+        return result
+    }
+}
 final class LoadWeightsTests: XCTestCase {
 
     // MARK: - Concurrent loading
@@ -447,6 +541,238 @@ final class LoadWeightsTests: XCTestCase {
         } catch {
             // expected
         }
+    }
+
+    func testLoadWeightsSanitizesCompleteCheckpointBeforeEvaluatingDiscardedTensor() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeSanitizingCheckpoint(in: directory, metadata: ["format": "fixture", "transpose": "true"])
+        let model = SanitizingCheckpointModel()
+
+        try loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertEqual(model.probe.invocationCount, 1)
+        XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
+        XCTAssertEqual(model.probe.metadata, ["format": "fixture", "transpose": "true"])
+        XCTAssertEqual(model.probe.discardedWasMaterializedAtEntry, false)
+        let discarded = try XCTUnwrap(model.probe.discardedTensor)
+        XCTAssertEqual(discarded.dtype, .float32)
+        XCTAssertNil(mlx_array_data_float32(discarded.ctx))
+        XCTAssertEqual(model.probe.inspectedLayerValues, [1, 2, 3, 4, 90, 91])
+        XCTAssertEqual(model.layer.weight.shape, [2, 2])
+        XCTAssertEqual(model.layer.weight.asArray(Float.self), [1, 3, 2, 4])
+        XCTAssertEqual(model.projector.weight.asArray(Float.self), [31, 32, 33, 34])
+        XCTAssertEqual(model.probe.preparationCount, 1)
+        XCTAssertEqual(model.probe.layerValuesAtPreparation, [1, 3, 2, 4])
+        XCTAssertEqual(model.probe.projectorValuesAtPreparation, [31, 32, 33, 34])
+        XCTAssertNil(mlx_array_data_float32(discarded.ctx))
+    }
+
+    func testLoadWeightArraysDefaultStillMaterializesEverySelectedTensor() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeSanitizingCheckpoint(in: directory)
+        let urls = ["model.safetensors", "projector.safetensors"].map {
+            directory.appendingPathComponent($0)
+        }
+
+        let (weights, _) = try loadWeightArrays(urls: urls)
+
+        XCTAssertEqual(Set(weights.keys), ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
+        for key in ["checkpoint.layer", "checkpoint.projector", "unused.weight"] {
+            let array = try XCTUnwrap(weights[key])
+            XCTAssertEqual(array.dtype, .float32)
+            XCTAssertNotNil(mlx_array_data_float32(array.ctx), key)
+        }
+    }
+
+    func testLoadWeightsSanitizesMergedShardsWithLaterDuplicateAndFirstMetadata() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try save(
+            arrays: [
+                "checkpoint.layer": MLXArray(converting: [1.0, 2, 3, 4, 90, 91]).reshaped(3, 2),
+                "unused.weight": MLXArray(converting: [100.0, 101, 102, 103]),
+            ],
+            metadata: ["transpose": "true", "source": "first"],
+            url: directory.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try save(
+            arrays: [
+                "checkpoint.layer": MLXArray(converting: [11.0, 12, 13, 14, 90, 91]).reshaped(3, 2),
+                "checkpoint.projector": MLXArray.zeros([2, 2]),
+            ],
+            metadata: ["transpose": "false", "source": "second"],
+            url: directory.appendingPathComponent("model-00002-of-00002.safetensors"))
+        try save(
+            arrays: ["checkpoint.projector": MLXArray(converting: [31.0, 32, 33, 34]).reshaped(2, 2)],
+            metadata: ["transpose": "false", "source": "sidecar"],
+            url: directory.appendingPathComponent("projector.safetensors"))
+        try writeIndex([
+            "checkpoint.layer": "model-00001-of-00002.safetensors",
+            "checkpoint.projector": "model-00002-of-00002.safetensors",
+        ], in: directory)
+        let model = SanitizingCheckpointModel()
+
+        try loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertEqual(model.probe.invocationCount, 1)
+        XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
+        XCTAssertEqual(model.probe.metadata, ["transpose": "true", "source": "first"])
+        XCTAssertEqual(model.probe.inspectedLayerValues, [11, 12, 13, 14, 90, 91])
+        XCTAssertEqual(model.layer.weight.asArray(Float.self), [11, 13, 12, 14])
+        XCTAssertEqual(model.projector.weight.asArray(Float.self), [31, 32, 33, 34])
+        XCTAssertEqual(model.probe.preparationCount, 1)
+        XCTAssertEqual(model.probe.layerValuesAtPreparation, [11, 13, 12, 14])
+        XCTAssertEqual(model.probe.projectorValuesAtPreparation, [31, 32, 33, 34])
+    }
+
+    func testLoadWeightsUsesFirstNonemptyMetadataWhenFirstSelectedFileHasNone() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let expectedMetadata = ["transpose": "true", "source": "sidecar"]
+        try writeSanitizingCheckpoint(in: directory, metadata: [:], sidecarMetadata: expectedMetadata)
+        let model = SanitizingCheckpointModel()
+
+        try loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertEqual(model.probe.invocationCount, 1)
+        XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
+        XCTAssertEqual(model.probe.metadata, expectedMetadata)
+        XCTAssertEqual(model.layer.weight.asArray(Float.self), [1, 3, 2, 4])
+        XCTAssertEqual(model.probe.layerValuesAtPreparation, [1, 3, 2, 4])
+        XCTAssertEqual(model.probe.preparationCount, 1)
+    }
+
+    func testLoadWeightsQuantizesSanitizedRetainedLayerWithoutQuantizingDenseSidecar() throws {
+        try assertSanitizedQuantizedCheckpoint(perLayerQuantization: false)
+    }
+
+    func testLoadWeightsUsesPerLayerQuantizationAfterCheckpointRemapping() throws {
+        try assertSanitizedQuantizedCheckpoint(perLayerQuantization: true)
+    }
+
+    func testLoadWeightsMissingDeclaredParametersFailsBeforeInferencePreparation() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeSanitizingCheckpoint(in: directory)
+        let model = SanitizingCheckpointModel(declaresSidecar: false)
+
+        XCTAssertThrowsError(try loadWeights(modelDirectory: directory, model: model))
+
+        XCTAssertEqual(model.probe.invocationCount, 1)
+        XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "unused.weight"])
+        XCTAssertEqual(model.probe.preparationCount, 0)
+        XCTAssertEqual(model.probe.layerValuesAtPreparation, [])
+        XCTAssertEqual(model.probe.projectorValuesAtPreparation, [])
+    }
+
+    func testLoadWeightsMalformedSelectedFileFailsBeforeSanitizing() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("not a safetensors file".utf8).write(
+            to: directory.appendingPathComponent("model.safetensors"))
+        let model = SanitizingCheckpointModel()
+
+        XCTAssertThrowsError(try loadWeights(modelDirectory: directory, model: model))
+
+        XCTAssertEqual(model.probe.invocationCount, 0)
+        XCTAssertEqual(model.probe.preparationCount, 0)
+        XCTAssertNil(model.probe.discardedTensor)
+    }
+
+    func testAsyncLoadWeightsAlsoSanitizesBeforeDiscardedTensorMaterialization() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try writeSanitizingCheckpoint(in: directory, metadata: ["transpose": "true"])
+        let model = SanitizingCheckpointModel()
+
+        try await loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertEqual(model.probe.invocationCount, 1)
+        XCTAssertEqual(model.probe.inputKeys, ["checkpoint.layer", "checkpoint.projector", "unused.weight"])
+        XCTAssertEqual(model.probe.metadata, ["transpose": "true"])
+        XCTAssertEqual(model.probe.discardedWasMaterializedAtEntry, false)
+        let discarded = try XCTUnwrap(model.probe.discardedTensor)
+        XCTAssertNil(mlx_array_data_float32(discarded.ctx))
+        XCTAssertEqual(model.probe.inspectedLayerValues, [1, 2, 3, 4, 90, 91])
+        XCTAssertEqual(model.layer.weight.asArray(Float.self), [1, 3, 2, 4])
+        XCTAssertEqual(model.projector.weight.asArray(Float.self), [31, 32, 33, 34])
+        XCTAssertEqual(model.probe.preparationCount, 1)
+        XCTAssertEqual(model.probe.layerValuesAtPreparation, [1, 3, 2, 4])
+        XCTAssertEqual(model.probe.projectorValuesAtPreparation, [31, 32, 33, 34])
+    }
+
+    private func writeSanitizingCheckpoint(
+        in directory: URL, metadata: [String: String] = [:],
+        sidecarMetadata: [String: String] = [:]
+    ) throws {
+        try save(
+            arrays: [
+                "checkpoint.layer": MLXArray(converting: [1.0, 2, 3, 4, 90, 91]).reshaped(3, 2),
+                "unused.weight": MLXArray(converting: [100.0, 101, 102, 103]),
+            ],
+            metadata: metadata, url: directory.appendingPathComponent("model.safetensors"))
+        try save(
+            arrays: ["checkpoint.projector": MLXArray(converting: [31.0, 32, 33, 34]).reshaped(2, 2)],
+            metadata: sidecarMetadata, url: directory.appendingPathComponent("projector.safetensors"))
+        try writeIndex(["checkpoint.layer": "model.safetensors"], in: directory)
+    }
+
+    private func assertSanitizedQuantizedCheckpoint(perLayerQuantization: Bool) throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = MLXArray((0..<64).map { Float($0 % 32) }).reshaped(2, 32)
+        let packed = MLX.quantized(source, groupSize: 32, bits: 4)
+        let biases = try XCTUnwrap(packed.biases)
+        let projector = MLXArray((0..<64).map { Float($0) }).reshaped(2, 32)
+        try save(
+            arrays: [
+                "checkpoint.layer.weight": packed.wq,
+                "checkpoint.layer.scales": packed.scales,
+                "checkpoint.layer.biases": biases,
+                "unused.weight": MLXArray(converting: [100.0, 101]),
+            ],
+            metadata: ["format": "quantized-fixture"],
+            url: directory.appendingPathComponent("model.safetensors"))
+        try save(
+            arrays: ["checkpoint.projector.weight": projector],
+            url: directory.appendingPathComponent("projector.safetensors"))
+        try writeIndex(["checkpoint.layer.weight": "model.safetensors"], in: directory)
+        let model = SanitizingQuantizedCheckpointModel()
+        if perLayerQuantization {
+            try loadWeights(
+                modelDirectory: directory, model: model,
+                perLayerQuantization: BaseConfiguration.PerLayerQuantization(
+                    quantization: .init(groupSize: 64, bits: 8),
+                    perLayerQuantization: [
+                        "layer": .quantize(.init(groupSize: 32, bits: 4)),
+                        "projector": .skip,
+                    ]))
+        } else {
+            try loadWeights(
+                modelDirectory: directory, model: model,
+                quantization: .init(groupSize: 32, bits: 4))
+        }
+
+        XCTAssertEqual(model.probe.invocationCount, 1)
+        XCTAssertEqual(model.probe.inputKeys, [
+            "checkpoint.layer.weight", "checkpoint.layer.scales", "checkpoint.layer.biases",
+            "checkpoint.projector.weight", "unused.weight",
+        ])
+        XCTAssertEqual(model.probe.metadata, ["format": "quantized-fixture"])
+        let layer = try XCTUnwrap(model.layer as? QuantizedLinear)
+        XCTAssertEqual(layer.groupSize, 32)
+        XCTAssertEqual(layer.bits, 4)
+        XCTAssertEqual(layer.weight.asArray(UInt32.self), packed.wq.asArray(UInt32.self))
+        XCTAssertEqual(layer.scales.asArray(Float.self), packed.scales.asArray(Float.self))
+        XCTAssertEqual(try XCTUnwrap(layer.biases).asArray(Float.self), biases.asArray(Float.self))
+        XCTAssertFalse(model.projector is QuantizedLinear)
+        XCTAssertEqual(model.projector.weight.asArray(Float.self), (0..<64).map { Float($0) })
+        let input = MLXArray.ones([1, 32])
+        let expected = MLX.quantizedMM(
+            input, packed.wq, scales: packed.scales, biases: biases,
+            transpose: true, groupSize: 32, bits: 4)
+        XCTAssertEqual(model.layer(input).asArray(Float.self), expected.asArray(Float.self))
     }
 
     /// Writes a checkpoint whose index names only `model.safetensors` while the head lives in
