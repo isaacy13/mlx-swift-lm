@@ -144,20 +144,12 @@ private final class ConcurrentLoadState: @unchecked Sendable {
     }
 }
 
-/// Load and materialize the weights of every file in `urls`, evaluating contiguous byte
-/// ranges of each file concurrently.
-///
-/// Each work item lazily opens its file, evaluates only its assigned tensors (forcing that
-/// range's I/O inside the work item), and the results are merged in file order. A file whose
-/// header cannot be parsed is loaded whole by one work item, which is exactly the serial
-/// loader's behavior for that file.
-func loadWeightArrays(urls: [URL]) throws -> (
+func loadWeightArrays(urls: [URL], materialize: Bool = true) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
     struct WorkItem {
         let file: Int
         let url: URL
-        /// tensors this item evaluates; nil evaluates the whole file
         let names: [String]?
     }
 
@@ -209,7 +201,7 @@ func loadWeightArrays(urls: [URL]) throws -> (
             }
 
             // force this range's I/O here, on this stream, in file-offset order
-            if !selected.isEmpty { eval(Array(selected.values)) }
+            if materialize && !selected.isEmpty { eval(Array(selected.values)) }
             state.merge(file: item.file, weights: selected, metadata: metadata)
         } catch {
             state.record(error: error)
@@ -379,7 +371,7 @@ public func loadWeights(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+    (weights, metadata) = try loadWeightArrays(urls: weightURLs, materialize: false)
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
